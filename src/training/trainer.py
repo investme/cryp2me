@@ -1,219 +1,169 @@
 """
-src/training/trainer.py
-────────────────────────
-Training engine for both LSTM and Transformer models.
-Uses combined MSE + BCE loss, AdamW + cosine LR schedule, early stopping.
+src/training/trainer.py — cryp2me.ai Phase 5
+Single-model training loop with early stopping and mixed loss.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 from torch.utils.data import DataLoader
-from typing import Optional, Tuple, Dict, List
+from pathlib import Path
+from typing import Dict, Any, Optional
 from rich.console import Console
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
-import time
 
 console = Console()
 
 
-class CombinedLoss(nn.Module):
-    """
-    Focal Loss for classification (pushes probabilities away from 0.5)
-    + MSE for regression.
-    """
-    def __init__(self, mse_weight: float = 0.4, bce_weight: float = 0.6, gamma: float = 2.0):
-        super().__init__()
-        self.mse   = nn.MSELoss()
-        self.gamma = 2.0
-        self.mse_w = mse_weight
-        self.bce_w = bce_weight
-
-    def focal_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred    = pred.clamp(1e-6, 1 - 1e-6)
-        bce     = -(target * torch.log(pred) + (1 - target) * torch.log(1 - pred))
-        pt      = torch.where(target == 1, pred, 1 - pred)
-        focal   = ((1 - pt) ** self.gamma) * bce
-        return focal.mean()
-
-    def forward(self, reg_pred, reg_true, cls_pred, cls_true):
-        mse_loss = self.mse(reg_pred, reg_true)
-        # Focal loss — penalises confident wrong predictions and wishy-washy 0.5 outputs
-        pred  = cls_pred.clamp(1e-6, 1 - 1e-6)
-        bce   = -(cls_true * torch.log(pred) + (1 - cls_true) * torch.log(1 - pred))
-        pt    = torch.where(cls_true == 1, pred, 1 - pred)
-        focal = ((1 - pt) ** self.gamma) * bce
-        focal_loss = focal.mean()
-        total = self.mse_w * mse_loss + self.bce_w * focal_loss
-        return total, {"mse": mse_loss.item(), "bce": focal_loss.item(), "total": total.item()} 
-
-class EarlyStopping:
-    def __init__(self, patience: int = 15, min_delta: float = 1e-5):
-        self.patience   = patience
-        self.min_delta  = min_delta
-        self.best_loss  = float("-inf")
-        self.counter    = 0
-        self.best_state = None
-
-    def __call__(self, val_loss: float, model: nn.Module, val_acc: float = 0.0) -> bool:
-        score = val_acc - val_loss * 0.1
-        if score > self.best_loss - self.min_delta:
-            self.best_loss  = score
-            self.counter    = 0
-            self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            self.counter += 1
-        return self.counter >= self.patience
-
-    def restore_best(self, model: nn.Module):
-        if self.best_state is not None:
-            model.load_state_dict(self.best_state)
-
-def compute_directional_accuracy(cls_pred: np.ndarray, cls_true: np.ndarray) -> float:
-    """Binary accuracy — predicted direction matches actual direction."""
-    pred_dir = (cls_pred > 0.5).astype(int)
-    return float((pred_dir == cls_true.astype(int)).mean())
-
-
-def train_epoch(
-    model:      nn.Module,
-    loader:     DataLoader,
-    optimizer:  torch.optim.Optimizer,
-    criterion:  CombinedLoss,
-    device:     str,
-    grad_clip:  float = 1.0,
-) -> Dict[str, float]:
-    model.train()
-    total_losses = {"mse": 0., "bce": 0., "total": 0.}
-    n_batches = 0
-
-    for x, y_reg, y_cls, _ in loader:
-        x, y_reg, y_cls = x.to(device), y_reg.to(device), y_cls.to(device)
-
-        optimizer.zero_grad()
-        reg_out, cls_out = model(x)
-        loss, losses = criterion(reg_out, y_reg, cls_out, y_cls)
-        loss.backward()
-
-        if grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-        optimizer.step()
-        for k, v in losses.items():
-            total_losses[k] += v
-        n_batches += 1
-
-    return {k: v / n_batches for k, v in total_losses.items()}
-
-
-@torch.no_grad()
-def eval_epoch(
-    model:     nn.Module,
-    loader:    DataLoader,
-    criterion: CombinedLoss,
-    device:    str,
-) -> Dict[str, float]:
-    model.eval()
-    total_losses = {"mse": 0., "bce": 0., "total": 0.}
-    all_cls_pred, all_cls_true = [], []
-    n_batches = 0
-
-    for x, y_reg, y_cls, _ in loader:
-        x, y_reg, y_cls = x.to(device), y_reg.to(device), y_cls.to(device)
-        reg_out, cls_out = model(x)
-        loss, losses = criterion(reg_out, y_reg, cls_out, y_cls)
-
-        for k, v in losses.items():
-            total_losses[k] += v
-
-        all_cls_pred.append(cls_out.cpu().numpy())
-        all_cls_true.append(y_cls.cpu().numpy())
-        n_batches += 1
-
-    avg_losses = {k: v / n_batches for k, v in total_losses.items()}
-    if all_cls_pred:
-        pred = np.concatenate(all_cls_pred, axis=0)
-        true = np.concatenate(all_cls_true, axis=0)
-        avg_losses["dir_acc"] = compute_directional_accuracy(pred, true)
-
-    return avg_losses
+def combined_loss(
+    pred_reg: torch.Tensor,
+    pred_cls: torch.Tensor,
+    y_reg:    torch.Tensor,
+    y_cls:    torch.Tensor,
+    mse_w:    float = 0.4,
+    bce_w:    float = 0.6,
+) -> torch.Tensor:
+    """MSE on returns + BCE on direction. Weighted combination."""
+    mse = nn.functional.mse_loss(pred_reg, y_reg)
+    bce = nn.functional.binary_cross_entropy(
+        pred_cls.clamp(1e-6, 1 - 1e-6), y_cls
+    )
+    return mse_w * mse + bce_w * bce
 
 
 def train_model(
-    model:          nn.Module,
-    train_loader:   DataLoader,
-    val_loader:     DataLoader,
-    device:         str,
-    epochs:         int        = 100,
-    lr:             float      = 1e-3,
-    weight_decay:   float      = 1e-4,
-    patience:       int        = 15,
-    grad_clip:      float      = 1.0,
-    warmup_epochs:  int        = 5,
-    mse_weight:     float      = 0.6,
-    bce_weight:     float      = 0.4,
-    model_name:     str        = "model",
-) -> Dict[str, List]:
+    model:           nn.Module,
+    train_loader:    DataLoader,
+    val_loader:      DataLoader,
+    device:          str,
+    epochs:          int           = 100,
+    lr:              float         = 1e-3,
+    patience:        int           = 8,
+    weight_decay:    float         = 1e-4,
+    grad_clip:       float         = 1.0,
+    mse_weight:      float         = 0.4,
+    bce_weight:      float         = 0.6,
+    checkpoint_path: Optional[Path]= None,
+    model_kwargs:    Optional[Dict] = None,
+    fold_idx:        int            = 0,
+) -> Dict[str, Any]:
     """
-    Full training loop with early stopping, LR warmup + cosine decay.
-    Returns history dict with train/val losses and accuracy per epoch.
+    Train a model with early stopping.
+
+    Returns dict:
+        best_dir_acc, best_val_loss, history, oof_preds, oof_labels
     """
-    model = model.to(device)
-    criterion = CombinedLoss(mse_weight, bce_weight)
+    optimiser = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=epochs)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=weight_decay
-    )
+    best_val_loss  = float("inf")
+    best_dir_acc   = 0.0
+    patience_count = 0
+    history        = []
+    best_state     = None
 
-    # Cosine annealing with warmup
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return float(epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
-        return 0.5 * (1.0 + np.cos(np.pi * progress))
+    for epoch in range(epochs):
+        # ── Train ─────────────────────────────────────────────────────────────
+        model.train()
+        train_losses = []
+        for x, y_reg, y_cls, _ in train_loader:
+            x     = x.to(device)
+            y_reg = y_reg.to(device)
+            y_cls = y_cls.to(device)
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    stopper   = EarlyStopping(patience=patience)
+            optimiser.zero_grad()
+            pred_reg, pred_cls = model(x)
+            loss = combined_loss(pred_reg, pred_cls, y_reg, y_cls, mse_weight, bce_weight)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimiser.step()
+            train_losses.append(loss.item())
 
-    history = {"train_loss": [], "val_loss": [], "val_dir_acc": [], "lr": []}
+        scheduler.step()
 
-    console.print(f"\n[bold cyan]🏋  Training {model_name}[/bold cyan]  "
-                  f"[dim]({sum(p.numel() for p in model.parameters() if p.requires_grad):,} params)[/dim]")
+        # ── Validate ──────────────────────────────────────────────────────────
+        model.eval()
+        val_losses   = []
+        all_cls_pred = []
+        all_cls_true = []
 
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task(f"Training", total=epochs)
+        with torch.no_grad():
+            for x, y_reg, y_cls, _ in val_loader:
+                x     = x.to(device)
+                y_reg = y_reg.to(device)
+                y_cls = y_cls.to(device)
 
-        for epoch in range(epochs):
-            t0 = time.time()
+                pred_reg, pred_cls = model(x)
+                loss = combined_loss(pred_reg, pred_cls, y_reg, y_cls, mse_weight, bce_weight)
+                val_losses.append(loss.item())
 
-            train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, grad_clip)
-            val_metrics   = eval_epoch(model, val_loader, criterion, device)
-            scheduler.step()
+                all_cls_pred.append(pred_cls.cpu().numpy())
+                all_cls_true.append(y_cls.cpu().numpy())
 
-            current_lr = optimizer.param_groups[0]["lr"]
-            history["train_loss"].append(train_metrics["total"])
-            history["val_loss"].append(val_metrics["total"])
-            history["val_dir_acc"].append(val_metrics.get("dir_acc", 0.0))
-            history["lr"].append(current_lr)
+        train_loss = np.mean(train_losses)
+        val_loss   = np.mean(val_losses)
+        preds      = np.concatenate(all_cls_pred, axis=0)
+        labels     = np.concatenate(all_cls_true, axis=0)
+        dir_acc    = (((preds > 0.5).astype(float)) == labels).mean()
 
-            elapsed = time.time() - t0
-            progress.update(task, advance=1,
-                description=f"Ep {epoch+1:3d} | "
-                            f"loss {train_metrics['total']:.4f}→{val_metrics['total']:.4f} | "
-                            f"dir_acc {val_metrics.get('dir_acc', 0)*100:.1f}% | "
-                            f"{elapsed:.1f}s")
+        history.append({
+            "epoch":      epoch,
+            "train_loss": float(train_loss),
+            "val_loss":   float(val_loss),
+            "dir_acc":    float(dir_acc),
+        })
 
-            if stopper(val_metrics["total"], model, val_metrics.get("dir_acc", 0.0)):
-                console.print(f"  [yellow]Early stop at epoch {epoch+1}[/yellow]")
+        # Log every 5 epochs
+        if epoch % 5 == 0 or epoch < 3:
+            console.print(
+                f"     Ep {epoch:3d}  "
+                f"train={train_loss:.4f}  val={val_loss:.4f}  "
+                f"dir_acc={dir_acc*100:.1f}%"
+            )
+
+        # ── Early stopping ────────────────────────────────────────────────────
+        if val_loss < best_val_loss:
+            best_val_loss  = val_loss
+            best_dir_acc   = float(dir_acc)
+            patience_count = 0
+            best_state     = {k: v.clone() for k, v in model.state_dict().items()}
+
+            if checkpoint_path is not None:
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "fold":        fold_idx,
+                    "model_state": best_state,
+                    "model_kwargs":model_kwargs or {},
+                    "history":     history,
+                }, checkpoint_path)
+        else:
+            patience_count += 1
+            if patience_count >= patience:
+                console.print(f"     [yellow]Early stop at epoch {epoch}[/yellow]")
                 break
 
-    stopper.restore_best(model)
-    best_acc = max(history["val_dir_acc"])
-    console.print(f"  [bold green]✓  Best val dir_acc: {best_acc*100:.2f}%[/bold green]\n")
-    return history
+    # Restore best weights
+    if best_state:
+        model.load_state_dict(best_state)
+
+    # OOF predictions from best model
+    model.eval()
+    oof_preds  = []
+    oof_labels = []
+    with torch.no_grad():
+        for x, _, y_cls, _ in val_loader:
+            _, pred_cls = model(x.to(device))
+            oof_preds.append(pred_cls.cpu().numpy())
+            oof_labels.append(y_cls.numpy())
+
+    console.print(
+        f"     [bold green]Best: val_loss={best_val_loss:.4f}  "
+        f"dir_acc={best_dir_acc*100:.2f}%[/bold green]"
+    )
+
+    return {
+        "best_dir_acc":  best_dir_acc,
+        "best_val_loss": best_val_loss,
+        "history":       history,
+        "oof_preds":     np.concatenate(oof_preds,  axis=0) if oof_preds  else np.array([]),
+        "oof_labels":    np.concatenate(oof_labels, axis=0) if oof_labels else np.array([]),
+    }

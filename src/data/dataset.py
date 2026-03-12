@@ -1,122 +1,114 @@
 """
-src/data/dataset.py
-───────────────────
-PyTorch Dataset that creates sliding-window sequences from feature DataFrames.
+src/data/dataset.py — cryp2me.ai Phase 5
+PyTorch Dataset and fold splitters.
+
+Key fixes vs Phase 4:
+  - make_fold() has correct signature matching walk_forward_cv.py
+  - No bash commands accidentally appended
+  - Augmentation only on technical features (not regime/macro)
 """
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
-from typing import List, Tuple
+from torch.utils.data import Dataset, DataLoader
+from typing import Dict, List, Optional, Tuple
 
-
-FEATURE_COLS = [
-    "open_pct", "high_pct", "low_pct", "close_pct",
-    "volume_norm", "volume_ratio",
-    "ema10_dist", "ema20_dist", "ema34_dist",
-    "rsi14", "macd", "macd_signal", "macd_hist",
-    "atr14_norm", "bb_width",
-    "adx14", "plus_di", "minus_di",
-]
-
-TARGET_REG_COLS = ["ret1", "ret2", "ret3"]   # regression targets
-TARGET_CLS_COLS = ["dir1", "dir2", "dir3"]   # classification targets
+from src.data.features import FEATURE_COLS, TARGET_REG_COLS, TARGET_CLS_COLS
 
 
 class CryptoSequenceDataset(Dataset):
     """
-    Sliding window dataset.
+    Sequence dataset for crypto OHLCV + feature data.
 
-    Each sample:
-      x  — (seq_len, n_features)   float32
-      y_reg — (3,)   future % returns
-      y_cls — (3,)   future directions (0/1)
-      price — scalar   closing price at sequence end (for inverse transform)
+    Each sample is a (seq_len, n_features) window with targets:
+        x      : (seq_len, 35) float32 feature tensor
+        y_reg  : (3,) float32  — ret1, ret2, ret3
+        y_cls  : (3,) float32  — dir1, dir2, dir3
+        price  : scalar float32 — closing price at sequence end
     """
 
     def __init__(
         self,
-        dfs: List[pd.DataFrame],
-        seq_len: int = 60,
+        dfs:     List[pd.DataFrame],
+        seq_len: int  = 168,
         augment: bool = False,
     ):
-        self.seq_len  = seq_len
-        self.augment  = augment
+        self.seq_len = seq_len
+        self.augment = augment
         self.samples: List[Tuple] = []
 
         for df in dfs:
-            X   = df[FEATURE_COLS].values.astype(np.float32)
-            y_r = df[TARGET_REG_COLS].values.astype(np.float32)
-            y_c = df[TARGET_CLS_COLS].values.astype(np.float32)
+            # Ensure all feature columns exist
+            for col in FEATURE_COLS:
+                if col not in df.columns:
+                    df[col] = 0.0
+
+            X      = np.clip(df[FEATURE_COLS].values.astype(np.float32), -10, 10)
+            y_reg  = df[TARGET_REG_COLS].values.astype(np.float32)
+            y_cls  = df[TARGET_CLS_COLS].values.astype(np.float32)
             prices = df["close"].values.astype(np.float32)
 
-            # Clip extreme values to reduce outlier impact
-            X = np.clip(X, -10, 10)
-
             for i in range(seq_len, len(df)):
-                # Labels are at position i (predict from window ending at i-1)
-                if np.any(np.isnan(y_r[i])) or np.any(np.isnan(y_c[i])):
+                if np.any(np.isnan(y_reg[i])) or np.any(np.isnan(y_cls[i])):
+                    continue
+                if np.any(np.isnan(X[i-seq_len:i])):
                     continue
                 self.samples.append((
-                    X[i - seq_len : i],   # (seq_len, 18)
-                    y_r[i],               # (3,)
-                    y_c[i],               # (3,)
-                    prices[i - 1],        # last close price
+                    X[i-seq_len:i].copy(),
+                    y_reg[i].copy(),
+                    y_cls[i].copy(),
+                    float(prices[i-1]),
                 ))
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        x, y_r, y_c, price = self.samples[idx]
-
+        x, y_reg, y_cls, price = self.samples[idx]
         if self.augment:
-            # Light Gaussian noise augmentation
-            noise = np.random.normal(0, 0.002, x.shape).astype(np.float32)
-            x = x + noise
-            # Random scale jitter ±1%
-            scale = np.random.uniform(0.99, 1.01)
-            x = x * scale
-
+            x = x.copy()
+            # Only augment technical features (first 22), not macro/regime
+            noise = np.random.normal(0, 0.002, (x.shape[0], 22)).astype(np.float32)
+            x[:, :22] += noise
+            x[:, :22] *= np.random.uniform(0.99, 1.01)
         return (
             torch.from_numpy(x),
-            torch.from_numpy(y_r),
-            torch.from_numpy(y_c),
+            torch.from_numpy(y_reg),
+            torch.from_numpy(y_cls),
             torch.tensor(price, dtype=torch.float32),
         )
 
 
-def split_df_chronological(
-    df: pd.DataFrame,
-    val_ratio: float = 0.1,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Chronological split — no shuffling."""
-    split = int(len(df) * (1 - val_ratio))
-    return df.iloc[:split], df.iloc[split:]
-
-
-cat >> src/data/dataset.py << 'EOF'
-
-
 def make_fold(
-    all_features: dict,
+    all_features: Dict[str, pd.DataFrame],
     fold_idx:     int,
     n_folds:      int,
-    seq_len:      int = 168,
-    val_ratio:    float = 0.1,
-    gap_days:     int = 30,
-    batch_size:   int = 64,
-):
+    seq_len:      int   = 168,
+    val_ratio:    float = 0.1,   # kept for API compatibility, not used
+    gap_days:     int   = 3,
+    batch_size:   int   = 64,
+) -> Tuple[CryptoSequenceDataset, CryptoSequenceDataset]:
     """
-    Walk-forward fold splitter — compatible with existing walk_forward_cv.py.
-    Splits each ticker's data chronologically, returns train/val Datasets.
-    """
-    from torch.utils.data import DataLoader
-    import math
+    Walk-forward fold splitter.
 
-    train_dfs = []
-    val_dfs   = []
+    Splits each ticker's data chronologically:
+        [0 ... train_end] [gap] [val_start ... val_end]
+
+    Args:
+        all_features: {ticker: feature_df}
+        fold_idx:     0-based fold index (0 = most recent fold)
+        n_folds:      total number of folds
+        seq_len:      sequence length in hours
+        val_ratio:    unused, kept for API compatibility
+        gap_days:     days gap between train and val
+        batch_size:   unused, kept for API compatibility
+
+    Returns:
+        (train_dataset, val_dataset)
+    """
+    train_dfs: List[pd.DataFrame] = []
+    val_dfs:   List[pd.DataFrame] = []
 
     for ticker, df in all_features.items():
         n       = len(df)
@@ -126,8 +118,8 @@ def make_fold(
 
         val_end   = n - fold_idx * fold_sz
         val_start = val_end - fold_sz
-        gap       = gap_days * 24   # hourly candles
-        train_end = max(0, val_start - gap)
+        gap_hours = gap_days * 24
+        train_end = max(0, val_start - gap_hours)
 
         if train_end < seq_len + 50:
             continue
@@ -138,5 +130,19 @@ def make_fold(
     train_ds = CryptoSequenceDataset(train_dfs, seq_len, augment=True)
     val_ds   = CryptoSequenceDataset(val_dfs,   seq_len, augment=False)
     return train_ds, val_ds
-EOF
-echo "Done"
+
+
+def make_fold_loaders(
+    train_dfs:    List[pd.DataFrame],
+    val_dfs:      List[pd.DataFrame],
+    seq_len:      int            = 168,
+    batch_size:   int            = 64,
+    feature_cols: Optional[List] = None,
+) -> Tuple[DataLoader, DataLoader]:
+    """Create DataLoaders from pre-split dataframe lists."""
+    train_ds = CryptoSequenceDataset(train_dfs, seq_len, augment=True)
+    val_ds   = CryptoSequenceDataset(val_dfs,   seq_len, augment=False)
+    return (
+        DataLoader(train_ds, batch_size=batch_size,   shuffle=True,  num_workers=0, pin_memory=False),
+        DataLoader(val_ds,   batch_size=batch_size*2, shuffle=False, num_workers=0, pin_memory=False),
+    )
