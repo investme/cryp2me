@@ -18,7 +18,7 @@ class DataConfig(BaseModel):
     ]
     interval:            str       = "1h"          # hourly candles
     lookback_days:       int       = 4 * 365       # 4 years
-    sequence_length:     int       = 168           # 1 week lookback
+    sequence_length:     int       = 48           # 1 week lookback
     prediction_horizons: List[int] = [24, 48, 72]  # T+1d, T+2d, T+3d
     n_horizons:          int       = 3
     val_size:            float     = 0.1
@@ -65,7 +65,7 @@ class TransformerConfig(BaseModel):
 
 
 class TrainConfig(BaseModel):
-    batch_size:    int   = 64
+    batch_size:    int   = 16
     epochs:        int   = 100
     lr:            float = 1e-3
     learning_rate: float = 1e-3   # alias for lr

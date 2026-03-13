@@ -14,62 +14,29 @@ from rich.console import Console
 console = Console()
 
 
-def combined_loss(
-    pred_reg: torch.Tensor,
-    pred_cls: torch.Tensor,
-    y_reg:    torch.Tensor,
-    y_cls:    torch.Tensor,
-    mse_w:    float = 0.4,
-    bce_w:    float = 0.6,
-) -> torch.Tensor:
-    """MSE on returns + BCE on direction. Weighted combination."""
+def combined_loss(pred_reg, pred_cls, y_reg, y_cls, mse_w=0.4, bce_w=0.6):
     mse = nn.functional.mse_loss(pred_reg, y_reg)
-    bce = nn.functional.binary_cross_entropy(
-        pred_cls.clamp(1e-6, 1 - 1e-6), y_cls
-    )
+    bce = nn.functional.binary_cross_entropy(pred_cls.clamp(1e-6, 1-1e-6), y_cls)
     return mse_w * mse + bce_w * bce
 
 
 def train_model(
-    model:           nn.Module,
-    train_loader:    DataLoader,
-    val_loader:      DataLoader,
-    device:          str,
-    epochs:          int           = 100,
-    lr:              float         = 1e-3,
-    patience:        int           = 8,
-    weight_decay:    float         = 1e-4,
-    grad_clip:       float         = 1.0,
-    mse_weight:      float         = 0.4,
-    bce_weight:      float         = 0.6,
-    checkpoint_path: Optional[Path]= None,
-    model_kwargs:    Optional[Dict] = None,
-    fold_idx:        int            = 0,
-) -> Dict[str, Any]:
-    """
-    Train a model with early stopping.
-
-    Returns dict:
-        best_dir_acc, best_val_loss, history, oof_preds, oof_labels
-    """
+    model, train_loader, val_loader, device,
+    epochs=100, lr=1e-3, patience=8, weight_decay=1e-4,
+    grad_clip=1.0, mse_weight=0.4, bce_weight=0.6,
+    checkpoint_path=None, model_kwargs=None, fold_idx=0,
+):
+    model = model.to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=epochs)
-
-    best_val_loss  = float("inf")
-    best_dir_acc   = 0.0
-    patience_count = 0
-    history        = []
-    best_state     = None
+    best_val_loss, best_dir_acc, patience_count = float("inf"), 0.0, 0
+    history, best_state = [], None
 
     for epoch in range(epochs):
-        # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         train_losses = []
         for x, y_reg, y_cls, _ in train_loader:
-            x     = x.to(device)
-            y_reg = y_reg.to(device)
-            y_cls = y_cls.to(device)
-
+            x, y_reg, y_cls = x.to(device), y_reg.to(device), y_cls.to(device)
             optimiser.zero_grad()
             pred_reg, pred_cls = model(x)
             loss = combined_loss(pred_reg, pred_cls, y_reg, y_cls, mse_weight, bce_weight)
@@ -77,25 +44,16 @@ def train_model(
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimiser.step()
             train_losses.append(loss.item())
-
         scheduler.step()
 
-        # ── Validate ──────────────────────────────────────────────────────────
         model.eval()
-        val_losses   = []
-        all_cls_pred = []
-        all_cls_true = []
-
+        val_losses, all_cls_pred, all_cls_true = [], [], []
         with torch.no_grad():
             for x, y_reg, y_cls, _ in val_loader:
-                x     = x.to(device)
-                y_reg = y_reg.to(device)
-                y_cls = y_cls.to(device)
-
+                x, y_reg, y_cls = x.to(device), y_reg.to(device), y_cls.to(device)
                 pred_reg, pred_cls = model(x)
                 loss = combined_loss(pred_reg, pred_cls, y_reg, y_cls, mse_weight, bce_weight)
                 val_losses.append(loss.item())
-
                 all_cls_pred.append(pred_cls.cpu().numpy())
                 all_cls_true.append(y_cls.cpu().numpy())
 
@@ -104,66 +62,38 @@ def train_model(
         preds      = np.concatenate(all_cls_pred, axis=0)
         labels     = np.concatenate(all_cls_true, axis=0)
         dir_acc    = (((preds > 0.5).astype(float)) == labels).mean()
+        history.append({"epoch": epoch, "train_loss": float(train_loss), "val_loss": float(val_loss), "dir_acc": float(dir_acc)})
 
-        history.append({
-            "epoch":      epoch,
-            "train_loss": float(train_loss),
-            "val_loss":   float(val_loss),
-            "dir_acc":    float(dir_acc),
-        })
-
-        # Log every 5 epochs
         if epoch % 5 == 0 or epoch < 3:
-            console.print(
-                f"     Ep {epoch:3d}  "
-                f"train={train_loss:.4f}  val={val_loss:.4f}  "
-                f"dir_acc={dir_acc*100:.1f}%"
-            )
+            console.print(f"     Ep {epoch:3d}  train={train_loss:.4f}  val={val_loss:.4f}  dir_acc={dir_acc*100:.1f}%")
 
-        # ── Early stopping ────────────────────────────────────────────────────
         if val_loss < best_val_loss:
-            best_val_loss  = val_loss
-            best_dir_acc   = float(dir_acc)
-            patience_count = 0
-            best_state     = {k: v.clone() for k, v in model.state_dict().items()}
-
+            best_val_loss, best_dir_acc, patience_count = val_loss, float(dir_acc), 0
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
             if checkpoint_path is not None:
                 checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    "fold":        fold_idx,
-                    "model_state": best_state,
-                    "model_kwargs":model_kwargs or {},
-                    "history":     history,
-                }, checkpoint_path)
+                torch.save({"fold": fold_idx, "model_state": best_state, "model_kwargs": model_kwargs or {}, "history": history}, checkpoint_path)
         else:
             patience_count += 1
             if patience_count >= patience:
                 console.print(f"     [yellow]Early stop at epoch {epoch}[/yellow]")
                 break
 
-    # Restore best weights
     if best_state:
         model.load_state_dict(best_state)
 
-    # OOF predictions from best model
     model.eval()
-    oof_preds  = []
-    oof_labels = []
+    oof_preds, oof_labels = [], []
     with torch.no_grad():
         for x, _, y_cls, _ in val_loader:
             _, pred_cls = model(x.to(device))
             oof_preds.append(pred_cls.cpu().numpy())
             oof_labels.append(y_cls.numpy())
 
-    console.print(
-        f"     [bold green]Best: val_loss={best_val_loss:.4f}  "
-        f"dir_acc={best_dir_acc*100:.2f}%[/bold green]"
-    )
-
+    console.print(f"     [bold green]Best: val_loss={best_val_loss:.4f}  dir_acc={best_dir_acc*100:.2f}%[/bold green]")
     return {
-        "best_dir_acc":  best_dir_acc,
-        "best_val_loss": best_val_loss,
-        "history":       history,
-        "oof_preds":     np.concatenate(oof_preds,  axis=0) if oof_preds  else np.array([]),
-        "oof_labels":    np.concatenate(oof_labels, axis=0) if oof_labels else np.array([]),
+        "best_dir_acc": best_dir_acc, "best_val_loss": best_val_loss,
+        "history": history,
+        "oof_preds":  np.concatenate(oof_preds,  axis=0) if oof_preds  else np.array([]),
+        "oof_labels": np.concatenate(oof_labels, axis=0) if oof_labels else np.array([]),
     }
